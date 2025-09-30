@@ -253,7 +253,7 @@ if __name__ == "__main__":
     # Load model
     
     # Initialize a tokenizer and model
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name = "Qwen/Qwen3-1.7B"
     log(f"Loading model {model_name}...", log_path)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")

@@ -29,15 +29,41 @@ parser.add_argument('--seed', type=int, default=42, help='Seed for random number
 
 
 
-def format_prompt(system_prompt, user_prompt, use_system=True):
-    """ System prompt has the system and user prompts (question) and the header
-    for the assistant response according to the Llama docs.
+def format_prompt(system_prompt, user_prompt, use_system=True, tokenizer=None):
     """
+    Format prompt using Qwen3's ChatML format via tokenizer.apply_chat_template().
+    
+    Args:
+        system_prompt: The system instruction (x0 prompt)
+        user_prompt: The user question
+        use_system: Whether to include the system prompt
+        tokenizer: The Qwen3 tokenizer instance
+    
+    Returns:
+        Formatted prompt string ready for tokenization
+    """
+    if tokenizer is None:
+        raise ValueError("tokenizer parameter is required for Qwen3 format_prompt()")
+    
     if use_system:
-        _system_prompt = system_prompt
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
     else:
-        _system_prompt = ""
-    return f"<|start_header_id|>system<|end_header_id|>\n\n{_system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        messages = [
+            {"role": "user", "content": user_prompt}
+        ]
+    
+    # Use tokenizer's built-in chat template
+    # add_generation_prompt=True adds the assistant header without content
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
+    return prompt
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -57,8 +83,8 @@ if __name__ == "__main__":
 
 
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct").half()
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B").half()
     tokenizer.pad_token = tokenizer.eos_token
 
     model = model.cuda()
@@ -79,8 +105,8 @@ if __name__ == "__main__":
                 batch_end = min(i+args.batch_size, args.num_sequences_per_question)
                 # print(f"Batch: {batch_start}:{batch_end}")
                 # prompt_q_str = prompt_template.format(x0_str, question_str)
-                prompt_q_str = format_prompt(x0_str, question_str, use_system=True)
-                noprompt_q_str = format_prompt(x0_str, question_str, use_system=False)
+                prompt_q_str = format_prompt(x0_str, question_str, use_system=True, tokenizer=tokenizer)
+                noprompt_q_str = format_prompt(x0_str, question_str, use_system=False, tokenizer=tokenizer)
                 prompt_q_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)['input_ids']
                 noprompt_q_ids = tokenizer(noprompt_q_str, return_tensors="pt").to(model.device)['input_ids']
 

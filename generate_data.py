@@ -24,6 +24,8 @@ parser.add_argument('--temperature', type=float, default=2.0, help='Temperature 
 parser.add_argument('--batch_size', type=int, default=38, help='Batch size for processing')
 parser.add_argument('--model_name', type=str, default= "meta-llama/Meta-Llama-3-8B-Instruct", help='Model name to use')
 parser.add_argument('--traj_out_file', type=str, default="data/traj_lex.jsonl", help='Output file for generated sequences. Default = "data/traj_lex.jsonl"')
+parser.add_argument('--val_out_file', type=str, default="data/traj_lex_val.jsonl", help='Output file for validation sequences. Default = "data/traj_lex_val.jsonl"')
+parser.add_argument('--val_split', type=float, default=0.2, help='Fraction of questions to use for validation (0.0 to 1.0). Default = 0.2')
 parser.add_argument('--seed', type=int, default=42, help='Seed for random number generation')
 
 
@@ -77,8 +79,20 @@ if __name__ == "__main__":
     dataset = datasets.load_dataset('json', data_files=args.question_dataset).shuffle(seed=args.seed)
     print("Length of train_dataset: ", len(dataset['train']))
 
-
-
+    # Calculate train/val split
+    num_train_questions = int(args.num_questions * (1 - args.val_split))
+    num_val_questions = args.num_questions - num_train_questions
+    
+    # Ensure at least 1 question per split if both are non-zero
+    if args.val_split > 0.0 and args.val_split < 1.0:
+        if num_train_questions == 0:
+            num_train_questions = 1
+            num_val_questions = args.num_questions - 1
+        elif num_val_questions == 0:
+            num_val_questions = 1
+            num_train_questions = args.num_questions - 1
+    
+    print(f"Generating {num_train_questions} training questions and {num_val_questions} validation questions")
 
 
 
@@ -91,95 +105,192 @@ if __name__ == "__main__":
 
     num_q = 0
 
+    # Determine which files to open based on val_split
+    if args.val_split == 0.0:
+        # Only generate training data
+        with open(args.traj_out_file, 'w') as f_train:
+            pbar = tqdm(dataset['train'], total=args.num_questions)
+            for question in pbar:
+                if num_q >= args.num_questions:
+                    break
+                num_q += 1
+                question_str = question['question']
+                for i in range(0, args.num_sequences_per_question, args.batch_size):
+                    batch_start = i
+                    batch_end = min(i+args.batch_size, args.num_sequences_per_question)
+                    prompt_q_str = format_prompt(x0_str, question_str, use_system=True, tokenizer=tokenizer)
+                    noprompt_q_str = format_prompt(x0_str, question_str, use_system=False, tokenizer=tokenizer)
+                    prompt_q_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)['input_ids']
+                    noprompt_q_ids = tokenizer(noprompt_q_str, return_tensors="pt").to(model.device)['input_ids']
 
-    with open(args.traj_out_file, 'w') as f: 
-        pbar = tqdm(dataset['train'], total=args.num_questions)
-        for question in pbar: 
-            if num_q >= args.num_questions:
-                break
-            num_q += 1
-            question_str = question['question']
-            for i in range(0, args.num_sequences_per_question, args.batch_size): 
-                # print("Generating sequences for question: ", question)
-                batch_start = i
-                batch_end = min(i+args.batch_size, args.num_sequences_per_question)
-                # print(f"Batch: {batch_start}:{batch_end}")
-                # prompt_q_str = prompt_template.format(x0_str, question_str)
-                prompt_q_str = format_prompt(x0_str, question_str, use_system=True, tokenizer=tokenizer)
-                noprompt_q_str = format_prompt(x0_str, question_str, use_system=False, tokenizer=tokenizer)
-                prompt_q_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)['input_ids']
-                noprompt_q_ids = tokenizer(noprompt_q_str, return_tensors="pt").to(model.device)['input_ids']
+                    num_seq_to_gen = batch_end - batch_start
 
-                num_seq_to_gen = batch_end - batch_start
+                    batch_input_ids = prompt_q_ids.repeat(num_seq_to_gen, 1)
+                    attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).long()
 
-                # use the prompt string with the system prompt x0 and the question
-                # to generate trajectories
-                # input_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)
+                    output = model.generate(
+                        batch_input_ids, 
+                        attention_mask = attention_mask,
+                        do_sample = True, 
+                        max_new_tokens = args.max_sequence_length,
+                        min_length = args.min_sequence_length,
+                        temperature = args.temperature,
+                        pad_token_id = tokenizer.eos_token_id
+                    )
 
-                batch_input_ids = prompt_q_ids.repeat(num_seq_to_gen, 1)
-                attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).long()
+                    for j in range(num_seq_to_gen):
+                        generated_text = tokenizer.decode(output[j], skip_special_tokens=False)
+                        generated_text_mask = torch.ones_like(output[j])
+                        generated_text_mask[:batch_input_ids.shape[1]] *= 0
+                        gen_only = output[j][generated_text_mask == 1]
+                        nosys_input_ids = torch.cat([noprompt_q_ids[0], gen_only], dim=0)
+                        generated_text_mask[output[j] == tokenizer.eos_token_id] *= 0
+                        length_diff = output[j].shape[0] - nosys_input_ids.shape[0]
 
+                        example = {
+                            "text": generated_text,
+                            "input_ids": output[j].tolist(),
+                            "attention_mask": attention_mask[j].tolist(),
+                            "prompt_text": prompt_q_str,
+                            "prompt_text_nosys": noprompt_q_str,
+                            "prompt_input_ids": prompt_q_ids[0, :].tolist(),
+                            "prompt_input_ids_nosys": noprompt_q_ids[0, :].tolist(),
+                            "text_nosys": tokenizer.decode(nosys_input_ids),
+                            "input_ids_nosys": nosys_input_ids.tolist(),
+                            "generated_text_mask": generated_text_mask.tolist(),
+                            "generated_text_mask_nosys": generated_text_mask[length_diff:].tolist()
+                        }
 
+                        assert tokenizer.decode(nosys_input_ids[torch.tensor(example["generated_text_mask_nosys"])==1]) == tokenizer.decode(output[j][torch.tensor(example["generated_text_mask"])==1])
 
-                # output has shape [batch, num_tokens_total]
-                output = model.generate(
-                    batch_input_ids, 
-                    attention_mask = attention_mask,
-                    do_sample = True, 
-                    max_new_tokens = args.max_sequence_length,
-                    min_length = args.min_sequence_length,
-                    temperature = args.temperature,
-                    pad_token_id = tokenizer.eos_token_id
-                )
+                        json.dump(example, f_train)
+                        f_train.write("\n")
+        print(f"Training dataset saved to {args.traj_out_file}")
+    
+    elif args.val_split == 1.0:
+        # Only generate validation data
+        with open(args.val_out_file, 'w') as f_val:
+            pbar = tqdm(dataset['train'], total=args.num_questions)
+            for question in pbar:
+                if num_q >= args.num_questions:
+                    break
+                num_q += 1
+                question_str = question['question']
+                for i in range(0, args.num_sequences_per_question, args.batch_size):
+                    batch_start = i
+                    batch_end = min(i+args.batch_size, args.num_sequences_per_question)
+                    prompt_q_str = format_prompt(x0_str, question_str, use_system=True, tokenizer=tokenizer)
+                    noprompt_q_str = format_prompt(x0_str, question_str, use_system=False, tokenizer=tokenizer)
+                    prompt_q_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)['input_ids']
+                    noprompt_q_ids = tokenizer(noprompt_q_str, return_tensors="pt").to(model.device)['input_ids']
 
+                    num_seq_to_gen = batch_end - batch_start
 
+                    batch_input_ids = prompt_q_ids.repeat(num_seq_to_gen, 1)
+                    attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).long()
 
-                # attention_mask = output.ne(tokenizer.pad_token_id).long()
-                # with torch.no_grad(): 
-                #     inf_out = model(output, attention_mask = attention_mask)
-                # batch_logits = inf_out.logits # [batch, num_toks, vocab_size]
+                    output = model.generate(
+                        batch_input_ids, 
+                        attention_mask = attention_mask,
+                        do_sample = True, 
+                        max_new_tokens = args.max_sequence_length,
+                        min_length = args.min_sequence_length,
+                        temperature = args.temperature,
+                        pad_token_id = tokenizer.eos_token_id
+                    )
 
-                for j in range(num_seq_to_gen): 
-                    # Decode the generated sequence
-                    generated_text = tokenizer.decode(output[j], skip_special_tokens=False)
+                    for j in range(num_seq_to_gen):
+                        generated_text = tokenizer.decode(output[j], skip_special_tokens=False)
+                        generated_text_mask = torch.ones_like(output[j])
+                        generated_text_mask[:batch_input_ids.shape[1]] *= 0
+                        gen_only = output[j][generated_text_mask == 1]
+                        nosys_input_ids = torch.cat([noprompt_q_ids[0], gen_only], dim=0)
+                        generated_text_mask[output[j] == tokenizer.eos_token_id] *= 0
+                        length_diff = output[j].shape[0] - nosys_input_ids.shape[0]
 
-                    # # within generated_text, find prompt_q_str and replace with noprompt_q_str
-                    # nosys_input_str = generated_text.replace(prompt_q_str, noprompt_q_str)
-                    # nosys_input_ids = tokenizer(nosys_input_str, return_tensors="pt").to(model.device)['input_ids'][:, 1:]
+                        example = {
+                            "text": generated_text,
+                            "input_ids": output[j].tolist(),
+                            "attention_mask": attention_mask[j].tolist(),
+                            "prompt_text": prompt_q_str,
+                            "prompt_text_nosys": noprompt_q_str,
+                            "prompt_input_ids": prompt_q_ids[0, :].tolist(),
+                            "prompt_input_ids_nosys": noprompt_q_ids[0, :].tolist(),
+                            "text_nosys": tokenizer.decode(nosys_input_ids),
+                            "input_ids_nosys": nosys_input_ids.tolist(),
+                            "generated_text_mask": generated_text_mask.tolist(),
+                            "generated_text_mask_nosys": generated_text_mask[length_diff:].tolist()
+                        }
 
-                    # now do the same, but replace outputs[j] such that the subsequence prompt_q_ids becomes noprompt_q_ids
-                    # create a dictionary with the required format 
-                    # make an attention mask for the input_ids -- no attention to pad tokens 
-                    generated_text_mask = torch.ones_like(output[j]) # [num_tokens]
-                    generated_text_mask[:batch_input_ids.shape[1]] *= 0
+                        assert tokenizer.decode(nosys_input_ids[torch.tensor(example["generated_text_mask_nosys"])==1]) == tokenizer.decode(output[j][torch.tensor(example["generated_text_mask"])==1])
 
-                    gen_only = output[j][generated_text_mask == 1] # [num_generated_tokens]
+                        json.dump(example, f_val)
+                        f_val.write("\n")
+        print(f"Validation dataset saved to {args.val_out_file}")
+    
+    else:
+        # Generate both training and validation data
+        with open(args.traj_out_file, 'w') as f_train, open(args.val_out_file, 'w') as f_val:
+            pbar = tqdm(dataset['train'], total=args.num_questions)
+            for question in pbar:
+                if num_q >= args.num_questions:
+                    break
+                
+                # Determine which file to write to based on current question number
+                is_training = num_q < num_train_questions
+                current_file = f_train if is_training else f_val
+                
+                num_q += 1
+                question_str = question['question']
+                for i in range(0, args.num_sequences_per_question, args.batch_size):
+                    batch_start = i
+                    batch_end = min(i+args.batch_size, args.num_sequences_per_question)
+                    prompt_q_str = format_prompt(x0_str, question_str, use_system=True, tokenizer=tokenizer)
+                    noprompt_q_str = format_prompt(x0_str, question_str, use_system=False, tokenizer=tokenizer)
+                    prompt_q_ids = tokenizer(prompt_q_str, return_tensors="pt").to(model.device)['input_ids']
+                    noprompt_q_ids = tokenizer(noprompt_q_str, return_tensors="pt").to(model.device)['input_ids']
 
-                    nosys_input_ids = torch.cat([noprompt_q_ids[0], gen_only], dim=0) # [num_tokens]
-                    
-                    generated_text_mask[output[j] == tokenizer.eos_token_id] *= 0
+                    num_seq_to_gen = batch_end - batch_start
 
-                    length_diff = output[j].shape[0] - nosys_input_ids.shape[0]
+                    batch_input_ids = prompt_q_ids.repeat(num_seq_to_gen, 1)
+                    attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).long()
 
-                    example = {
-                        "text": generated_text,  # full prompt + generated text (str)
-                        "input_ids": output[j].tolist(), # full prompt + generated text (ids)
-                        "attention_mask": attention_mask[j].tolist(), # eh
-                        "prompt_text": prompt_q_str, # full prompt (str)
-                        "prompt_text_nosys": noprompt_q_str, # prompt without system prompt (includes question though)
-                        "prompt_input_ids": prompt_q_ids[0, :].tolist(), # 
-                        "prompt_input_ids_nosys": noprompt_q_ids[0, :].tolist(), # prom
-                        "text_nosys": tokenizer.decode(nosys_input_ids), # input ids with no system prompt (str)
-                        "input_ids_nosys": nosys_input_ids.tolist(), # input ids with no system prompt (ids)
-                        "generated_text_mask": generated_text_mask.tolist(), # applies to input_ids
-                        "generated_text_mask_nosys": generated_text_mask[length_diff:].tolist() # mask for noprompt_input_ids
-                        # "logits": batch_logits[j, :, :].tolist()
-                    }
+                    output = model.generate(
+                        batch_input_ids, 
+                        attention_mask = attention_mask,
+                        do_sample = True, 
+                        max_new_tokens = args.max_sequence_length,
+                        min_length = args.min_sequence_length,
+                        temperature = args.temperature,
+                        pad_token_id = tokenizer.eos_token_id
+                    )
 
-                    assert tokenizer.decode(nosys_input_ids[torch.tensor(example["generated_text_mask_nosys"])==1]) == tokenizer.decode(output[j][torch.tensor(example["generated_text_mask"])==1])
+                    for j in range(num_seq_to_gen):
+                        generated_text = tokenizer.decode(output[j], skip_special_tokens=False)
+                        generated_text_mask = torch.ones_like(output[j])
+                        generated_text_mask[:batch_input_ids.shape[1]] *= 0
+                        gen_only = output[j][generated_text_mask == 1]
+                        nosys_input_ids = torch.cat([noprompt_q_ids[0], gen_only], dim=0)
+                        generated_text_mask[output[j] == tokenizer.eos_token_id] *= 0
+                        length_diff = output[j].shape[0] - nosys_input_ids.shape[0]
 
-                    # writ ethe example to the jsonl file 
-                    json.dump(example, f)
-                    f.write("\n")
+                        example = {
+                            "text": generated_text,
+                            "input_ids": output[j].tolist(),
+                            "attention_mask": attention_mask[j].tolist(),
+                            "prompt_text": prompt_q_str,
+                            "prompt_text_nosys": noprompt_q_str,
+                            "prompt_input_ids": prompt_q_ids[0, :].tolist(),
+                            "prompt_input_ids_nosys": noprompt_q_ids[0, :].tolist(),
+                            "text_nosys": tokenizer.decode(nosys_input_ids),
+                            "input_ids_nosys": nosys_input_ids.tolist(),
+                            "generated_text_mask": generated_text_mask.tolist(),
+                            "generated_text_mask_nosys": generated_text_mask[length_diff:].tolist()
+                        }
 
-    print("Dataset saved to ", args.traj_out_file)
+                        assert tokenizer.decode(nosys_input_ids[torch.tensor(example["generated_text_mask_nosys"])==1]) == tokenizer.decode(output[j][torch.tensor(example["generated_text_mask"])==1])
+
+                        json.dump(example, current_file)
+                        current_file.write("\n")
+        print(f"Training dataset saved to {args.traj_out_file}")
+        print(f"Validation dataset saved to {args.val_out_file}")

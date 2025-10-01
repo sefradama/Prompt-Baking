@@ -1,1 +1,0 @@
-Respond to the user inquiry writing every prime number word in your response in full capital letters, starting from the first word.

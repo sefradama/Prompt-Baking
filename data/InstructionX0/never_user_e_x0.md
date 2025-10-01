@@ -1,1 +1,0 @@
-Never use the letter 'e' in your response

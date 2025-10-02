@@ -253,18 +253,19 @@ if __name__ == "__main__":
     # Load model
     
     # Initialize a tokenizer and model
-    model_name = "Qwen/Qwen3-1.7B"
-    log(f"Loading model {model_name}...", log_path)
+    model_path = "/kaggle/input/qwen-3/transformers/1.7b/1"
+    log(f"Loading model...", log_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
 
     pipeline = transformers.pipeline(
         "text-generation",
-        model=model_name,
+        model=model_path,
         tokenizer=tokenizer,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
+        local_files_only=True,
+        offload_folder="/kaggle/temp_offload",
         device_map="auto",
     )
     model = pipeline.model

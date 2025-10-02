@@ -32,9 +32,9 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training. Default = 10')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for optimizer. Default = 1e-4')
     parser.add_argument('--device', type=str, default="cuda" if torch.cuda.is_available() else "cpu", help='Device to run the training on. Default = "cuda" if available, else "cpu"')
-    parser.add_argument('--data_path', type=str, default="data/traj_lex_nseq1000_maxlen300_minlen100_temp2.0.jsonl", help='Path to the training data. Default = "data/train_traj_temp2.0_numq100_numseq25_x0truth_20240718.jsonl"')
-    parser.add_argument('--val_path', type=str, default="data/traj_lex_nseq1000_maxlen300_minlen100_temp2.0.jsonl", help='Path to the validation data. Default = "data/val_traj_temp2.0_numq25_numseq25_x0truth_20240718.jsonl"')
-    parser.add_argument('--out_dir', type=str, default="results/traj_lex_01", help='Output directory for results. Default = "results/traj_lex_01"')
+    parser.add_argument('--data_path', type=str, default="data/traj_chat.jsonl", help='Path to the training data. Default = "data/train_traj_temp2.0_numq100_numseq25_x0truth_20240718.jsonl"')
+    parser.add_argument('--val_path', type=str, default="data/traj_val.jsonl", help='Path to the validation data. Default = "data/val_traj_temp2.0_numq25_numseq25_x0truth_20240718.jsonl"')
+    parser.add_argument('--out_dir', type=str, default="results/traj_chat", help='Output directory for results. Default = "results/traj_lex_01"')
     parser.add_argument('-r', type=int, default=32, help='LoRA Rank')
     parser.add_argument('--save_every', type=int, default=1, help='Save model every n epochs. Default = 1')
 

@@ -11,11 +11,11 @@ parser = argparse.ArgumentParser(description="Model loading and generation param
 # arg: prompt_template, defaults to data/llama_sys_question_template.md
 # parser.add_argument('--prompt_template', type=str, default="data/llama_sys_question_template.md", help='Path to the prompt template file. Must have two {} instances, first for system prompt, second for question. Default = "data/llama_sys_question_template.md"')
 # arg: x0_file, defaults to data/truth_x0.md
-parser.add_argument('--x0_file', type=str, default="data/truth_x0.md", help='Path to the x0 file. Default = "data/truth_x0.md"')
+parser.add_argument('--x0_file', type=str, default="data/sardonic_x0.md", help='Path to the x0 file. Default = "data/truth_x0.md"')
 # arg: question_dataset_file, default data/squad_train.jsonl
-parser.add_argument('--question_dataset', type=str, default="data/squad_train.jsonl", help='Path to the question dataset file. Default = "data/squad_train.jsonl"')
+parser.add_argument('--question_dataset', type=str, default="data/chatmsgs.jsonl", help='Path to the question dataset file. Default = "data/squad_train.jsonl"')
 # arg:num_questions, default = 100
-parser.add_argument('--num_questions', type=int, default=100, help='Number of questions to generate. Default = 100')
+parser.add_argument('--num_questions', type=int, default=88, help='Number of questions to generate. Default = 100')
 
 parser.add_argument('--num_sequences_per_question', type=int, default=25, help='Number of sequences to generate per question (default: 25)')
 parser.add_argument('--max_sequence_length', type=int, default=300, help='Maximum length of each generated sequence')
@@ -23,8 +23,8 @@ parser.add_argument('--min_sequence_length', type=int, default=100, help='Minimu
 parser.add_argument('--temperature', type=float, default=2.0, help='Temperature for sequence generation')
 parser.add_argument('--batch_size', type=int, default=38, help='Batch size for processing')
 parser.add_argument('--model_name', type=str, default= "meta-llama/Meta-Llama-3-8B-Instruct", help='Model name to use')
-parser.add_argument('--traj_out_file', type=str, default="data/traj_lex.jsonl", help='Output file for generated sequences. Default = "data/traj_lex.jsonl"')
-parser.add_argument('--val_out_file', type=str, default="data/traj_lex_val.jsonl", help='Output file for validation sequences. Default = "data/traj_lex_val.jsonl"')
+parser.add_argument('--traj_out_file', type=str, default="data/traj_chat.jsonl", help='Output file for generated sequences. Default = "data/traj_lex.jsonl"')
+parser.add_argument('--val_out_file', type=str, default="data/traj_val.jsonl", help='Output file for validation sequences. Default = "data/traj_lex_val.jsonl"')
 parser.add_argument('--val_split', type=float, default=0.2, help='Fraction of questions to use for validation (0.0 to 1.0). Default = 0.2')
 parser.add_argument('--seed', type=int, default=42, help='Seed for random number generation')
 
@@ -62,7 +62,8 @@ def format_prompt(system_prompt, user_prompt, use_system=True, tokenizer=None):
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True
+        add_generation_prompt=True,
+        enable_thinking=False
     )
     
     return prompt

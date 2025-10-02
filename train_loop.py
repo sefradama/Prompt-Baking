@@ -4,6 +4,10 @@ import os
 import json
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import transformers
 from transformers import AutoTokenizer
 from datasets import load_dataset
@@ -68,10 +72,32 @@ if __name__ == "__main__":
 
 # make the out_dir if it doesn't already exist 
 import os
-def log(msg, file_path): 
+def setup_distributed():
+    """Initialize distributed training environment"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        # Initialize distributed process group
+        dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
+        torch.cuda.set_device(local_rank)
+        
+        return rank, world_size, local_rank
+    else:
+        # Single GPU mode
+        return 0, 1, 0
+
+def cleanup_distributed():
+    """Clean up distributed training environment"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def log(msg, file_path, rank=0):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(file_path, 'a') as f: 
-        f.write(f"[{current_time}] {msg}\n")
+    if rank == 0:  # Only rank 0 writes logs
+        with open(file_path, 'a') as f:
+            f.write(f"[{current_time}] {msg}\n")
 
 
 
@@ -160,22 +186,35 @@ def crop_trajectories(input_ids_list, mask_list, max_traj_len):
 
 
 def do_epoch(peft_model, tokenizer,
-             dataset, 
-             batch_size, 
-             log_path, 
-             optimizer, 
-             do_step = True, 
-             max_traj_len=-1):
+             dataset,
+             batch_size,
+             log_path,
+             optimizer,
+             do_step = True,
+             max_traj_len=-1,
+             rank=0,
+             world_size=1):
     """
     Trains the model for one epoch on the given dataset.
     """
     kl_divs = []
-    for i in tqdm(range(0, len(dataset['train']), batch_size)):
-        log(f"Batch {i}", log_path)
-        batch = dataset['train'][i:i+batch_size]
+    
+    # Use DistributedSampler for distributed training
+    if world_size > 1:
+        sampler = DistributedSampler(dataset['train'], num_replicas=world_size, rank=rank, shuffle=True)
+        indices = list(sampler)
+        batch_indices = [indices[i:i+batch_size] for i in range(0, len(indices), batch_size)]
+    else:
+        batch_indices = [list(range(i, min(i+batch_size, len(dataset['train'])))) for i in range(0, len(dataset['train']), batch_size)]
+    
+    for batch_idx in tqdm(batch_indices, disable=rank > 0):
+        log(f"Batch {batch_idx[0] if batch_idx else 0}", log_path, rank)
+        
+        # Get batch data
+        batch = dataset['train'].select(batch_idx)
 
 
-        # grab the input_ids_nosys to run thru the PEFT model 
+        # grab the input_ids_nosys to run thru the PEFT model
         input_ids_nosys_list_ = batch['input_ids_nosys'] # pad with tokenizer.pad_token_id
         input_ids_list_ = batch['input_ids'] # pad with tokenizer.pad_token_id
 
@@ -184,7 +223,7 @@ def do_epoch(peft_model, tokenizer,
         mask_list_ = batch['generated_text_mask'] # pad with 0
 
 
-        if max_traj_len > 0: 
+        if max_traj_len > 0:
             input_ids_list_, mask_list_ = crop_trajectories(input_ids_list_, mask_list_, max_traj_len)
             input_ids_nosys_list_, mask_nosys_list_ = crop_trajectories(input_ids_nosys_list_, mask_nosys_list_, max_traj_len)
 
@@ -211,68 +250,93 @@ def do_epoch(peft_model, tokenizer,
 
         assert (input_ids[mask] != input_ids_nosys[mask_nosys]).sum() == 0, "Prompted and unprompted input_ids do not match within their respective masks for the generated text (must be identical)"
 
-        # per-row sum over mask 
+        # per-row sum over mask
         assert (mask.sum(dim=1) == mask_nosys.sum(dim=1)).all(), "Prompted and unprompted masks must have the same number of tokens per row"
 
-        log("Computing unprompted logits...", log_path)
+        log("Computing unprompted logits...", log_path, rank)
         unprompted_logits_ = peft_model(input_ids_nosys).logits
-        log("Done computing prompted logits...", log_path)
+        log("Done computing prompted logits...", log_path, rank)
 
-        log("Computing prompted logits...", log_path)
-        with peft_model.disable_adapter():
-            with torch.no_grad():
-                prompted_logits_ = peft_model(input_ids).logits
-        log("Done computing prompted logits...", log_path)
+        log("Computing prompted logits...", log_path, rank)
+        # Handle DDP model wrapper for disable_adapter
+        if hasattr(peft_model, 'module'):
+            with peft_model.module.disable_adapter():
+                with torch.no_grad():
+                    prompted_logits_ = peft_model(input_ids).logits
+        else:
+            with peft_model.disable_adapter():
+                with torch.no_grad():
+                    prompted_logits_ = peft_model(input_ids).logits
+        log("Done computing prompted logits...", log_path, rank)
 
         unprompted_logits = unprompted_logits_[mask_nosys, :]
         prompted_logits = prompted_logits_[mask, :]
 
 
         # Compute KL divergence: KL(prompted, unprompted)
-        kl_div_ = F.kl_div(F.log_softmax(unprompted_logits, dim=-1), 
-                        F.log_softmax(prompted_logits, dim=-1), 
-                        reduction='none', 
+        kl_div_ = F.kl_div(F.log_softmax(unprompted_logits, dim=-1),
+                        F.log_softmax(prompted_logits, dim=-1),
+                        reduction='none',
                         log_target=True)
         
-        kl_div = kl_div_.sum() / batch_size
+        kl_div = kl_div_.sum() / len(batch_idx)
         
         kl_div.backward()
-        if do_step: 
+        
+        # Gradient clipping for stability with LoRA adapters
+        torch.nn.utils.clip_grad_norm_(peft_model.parameters(), max_norm=1.0)
+        
+        if do_step:
             optimizer.step()
         optimizer.zero_grad()
-        log(f"Done computing KL divergence = {kl_div.item()}", log_path)
+        log(f"Done computing KL divergence = {kl_div.item()}", log_path, rank)
         kl_divs.append(kl_div.item())
 
-    print(f"Epoch {epoch} loss: {sum(kl_divs)/len(kl_divs)}")
-    log(f"Epoch {epoch} loss: {sum(kl_divs)/len(kl_divs)}", log_path)
-    return kl_divs
+    # Average loss across all GPUs
+    if world_size > 1:
+        avg_kl_div = torch.tensor(sum(kl_divs)/len(kl_divs) if kl_divs else 0.0).to(device)
+        dist.all_reduce(avg_kl_div, op=dist.ReduceOp.AVG)
+        avg_kl_div = avg_kl_div.item()
+    else:
+        avg_kl_div = sum(kl_divs)/len(kl_divs) if kl_divs else 0.0
+
+    if rank == 0:
+        print(f"Epoch loss: {avg_kl_div}")
+        log(f"Epoch loss: {avg_kl_div}", log_path, rank)
+    
+    return kl_divs, avg_kl_div
 
 
 
 if __name__ == "__main__":
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    is_distributed = world_size > 1
+    
+    if is_distributed:
+        print(f"Running training on rank {rank}/{world_size}, local rank {local_rank}")
+    
     # Load model
     
     # Initialize a tokenizer and model
     model_path = "/kaggle/input/qwen-3/transformers/1.7b/1"
-    log(f"Loading model...", log_path)
+    log(f"Loading model...", log_path, rank)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
 
-    pipeline = transformers.pipeline(
-        "text-generation",
-        model=model_path,
-        tokenizer=tokenizer,
+    # Load model directly without pipeline for better DDP control
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
         torch_dtype=torch.bfloat16,
         local_files_only=True,
         offload_folder="/kaggle/temp_offload",
-        device_map="auto",
+        device_map=None,  # We'll handle device placement manually
     )
-    model = pipeline.model
 
-    log("Model loaded", log_path)
+    log("Model loaded", log_path, rank)
 
-    log("Loading PEFT model...", log_path)
+    log("Loading PEFT model...", log_path, rank)
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
@@ -281,20 +345,29 @@ if __name__ == "__main__":
         lora_dropout=0,
         bias="none",
         target_modules=[
-            "q_proj", 
-            "v_proj", 
-            "k_proj", 
+            "q_proj",
+            "v_proj",
+            "k_proj",
             "o_proj"
         ]
     )
     
+    # Apply LoRA to base model BEFORE DDP wrapping
     peft_model = get_peft_model(model, peft_config)
     print("unprompted model parameter stats:")
     peft_model.print_trainable_parameters()
-    log("PEFT model loaded", log_path)
+    log("PEFT model loaded", log_path, rank)
 
-    device = model.device
-
+    # Move model to specific GPU and wrap with DDP
+    device = torch.device(f'cuda:{local_rank}')
+    peft_model = peft_model.to(device)
+    
+    # Wrap PEFT model with DDP for distributed training
+    if is_distributed:
+        peft_model = DDP(peft_model, device_ids=[local_rank], find_unused_parameters=False)
+        print(f"PEFT model wrapped with DDP on rank {rank}")
+    
+    # Create optimizer after DDP wrapping
     optimizer = torch.optim.Adam(peft_model.parameters(), lr=learning_rate)
 
     # Run LORA
@@ -307,44 +380,68 @@ if __name__ == "__main__":
 
     best_val_loss = 10000000000
     for epoch in range(num_epochs):
-        log("Started epoch " + str(epoch), log_path)
-        train_kls = do_epoch(peft_model, tokenizer,
-                 dataset=dataset, 
+        # Set epoch for DistributedSampler
+        if is_distributed and hasattr(dataset['train'], 'set_epoch'):
+            dataset['train'].set_epoch(epoch)
+        
+        log("Started epoch " + str(epoch), log_path, rank)
+        train_kls, train_avg_kl = do_epoch(peft_model, tokenizer,
+                 dataset=dataset,
                  batch_size=batch_size,
                  log_path=log_path,
                  optimizer=optimizer,
-                 do_step=True, 
-                 max_traj_len=args.max_traj_len)
-        # log(f"All train kls (epoch={epoch}): ", train_kls)
-        log(f"Train kl divergence (epoch={epoch}): {sum(train_kls)/len(train_kls)}", log_path)
+                 do_step=True,
+                 max_traj_len=args.max_traj_len,
+                 rank=rank,
+                 world_size=world_size)
+        
+        log(f"Train kl divergence (epoch={epoch}): {train_avg_kl}", log_path, rank)
+        log("Done epoch " + str(epoch), log_path, rank)
 
-        log("Done epoch " + str(epoch), log_path)
-
-        log("Started validation epoch " + str(epoch), log_path)
-        val_kls = do_epoch(peft_model, tokenizer,
-                 dataset=val_dataset, 
+        log("Started validation epoch " + str(epoch), log_path, rank)
+        val_kls, val_avg_kl = do_epoch(peft_model, tokenizer,
+                 dataset=val_dataset,
                  batch_size=batch_size,
                  log_path=log_path,
                  optimizer=optimizer,
-                 do_step=False, 
-                 max_traj_len=args.max_traj_len)
-        # log(f"All validation kls (epoch={epoch}): "+ str(val_kls), log_path)
-        log(f"Validation kl divergence (epoch={epoch}): {sum(val_kls)/len(val_kls)}", log_path)
-        log("Done validation epoch " + str(epoch), log_path)
+                 do_step=False,
+                 max_traj_len=args.max_traj_len,
+                 rank=rank,
+                 world_size=world_size)
+        
+        log(f"Validation kl divergence (epoch={epoch}): {val_avg_kl}", log_path, rank)
+        log("Done validation epoch " + str(epoch), log_path, rank)
 
-        # save model every n epochs
-        if (epoch+1) % args.save_every == 0:
+        # Synchronize before saving to ensure all processes are at the same epoch
+        if is_distributed:
+            dist.barrier()
+
+        # save model every n epochs (only rank 0)
+        if (epoch+1) % args.save_every == 0 and rank == 0:
             out_epoch_dir = os.path.join(out_dir, f"epoch_{epoch}")
             if not os.path.exists(out_epoch_dir):
                 os.makedirs(out_epoch_dir)
 
-            log(f"Saving PEFT model to {out_epoch_dir}...", log_path)
-            peft_model.save_pretrained(out_epoch_dir)
-            log(f"Model saved to {out_epoch_dir}", log_path)
+            log(f"Saving PEFT model to {out_epoch_dir}...", log_path, rank)
+            # Handle DDP wrapper when saving
+            if hasattr(peft_model, 'module'):
+                peft_model.module.save_pretrained(out_epoch_dir)
+            else:
+                peft_model.save_pretrained(out_epoch_dir)
+            log(f"Model saved to {out_epoch_dir}", log_path, rank)
 
-        # save model
-        if sum(val_kls)/len(val_kls) < best_val_loss:
-            best_val_loss = sum(val_kls)/len(val_kls)
-            log(f"Saving PEFT model to {out_dir}...", log_path)
-            peft_model.save_pretrained(out_dir)
-            log(f"Model saved to {out_dir}", log_path)
+        # save best model (only rank 0)
+        if val_avg_kl < best_val_loss and rank == 0:
+            best_val_loss = val_avg_kl
+            log(f"Saving best PEFT model to {out_dir}...", log_path, rank)
+            # Handle DDP wrapper when saving
+            if hasattr(peft_model, 'module'):
+                peft_model.module.save_pretrained(out_dir)
+            else:
+                peft_model.save_pretrained(out_dir)
+            log(f"Best model saved to {out_dir}", log_path, rank)
+
+    # Clean up distributed training
+    cleanup_distributed()
+    if rank == 0:
+        print("Training completed!")

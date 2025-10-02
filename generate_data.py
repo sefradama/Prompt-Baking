@@ -116,17 +116,25 @@ if __name__ == "__main__":
     model_path = "/kaggle/input/qwen-3/transformers/1.7b/1"
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    
+    # Move model to specific GPU for distributed training BEFORE loading
+    device = torch.device(f'cuda:{local_rank}')
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto",
-        local_files_only=True,
-        offload_folder="/kaggle/temp_offload"
-    ).half()
+        torch_dtype=torch.float16,
+        local_files_only=True
+    )
+    
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Move model to specific GPU for distributed training
-    device = torch.device(f'cuda:{local_rank}')
+    # Move model to specific GPU after loading
     model = model.to(device)
+    
+    # Add diagnostic logging
+    if rank == 0:
+        print(f"Model loaded and moved to device: {device}")
+        print(f"Model device: {next(model.parameters()).device}")
     
     # Wrap model with DDP for distributed training
     if is_distributed:

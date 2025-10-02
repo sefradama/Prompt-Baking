@@ -39,7 +39,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, default="data/traj_chat.jsonl", help='Path to the training data. Default = "data/train_traj_temp2.0_numq100_numseq25_x0truth_20240718.jsonl"')
     parser.add_argument('--val_path', type=str, default="data/traj_val.jsonl", help='Path to the validation data. Default = "data/val_traj_temp2.0_numq25_numseq25_x0truth_20240718.jsonl"')
     parser.add_argument('--out_dir', type=str, default="results/traj_chat", help='Output directory for results. Default = "results/traj_lex_01"')
-    parser.add_argument('-r', type=int, default=32, help='LoRA Rank')
+    parser.add_argument('--lora_r', type=int, default=32, help='LoRA Rank')
     parser.add_argument('--save_every', type=int, default=1, help='Save model every n epochs. Default = 1')
 
     parser.add_argument('--max_traj_len', type=int, default=-1, help='Maximum usable trajectory length from the dataset. Default = -1 (use all)')
@@ -329,9 +329,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        offload_folder="/kaggle/temp_offload",
-        device_map=None,  # We'll handle device placement manually
+        local_files_only=True
     )
 
     log("Model loaded", log_path, rank)
@@ -340,7 +338,7 @@ if __name__ == "__main__":
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=args.r,
+        r=args.lora_r,
         lora_alpha=1,
         lora_dropout=0,
         bias="none",

@@ -25,7 +25,7 @@ torchrun --nproc_per_node=2 train_loop.py \
     --num_epochs 1000 \
     --batch_size 10 \
     --learning_rate 1e-4 \
-    --r 32 \
+    --lora_r 32 \
     --save_every 1
 
 echo "Distributed training completed!"
